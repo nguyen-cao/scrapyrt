@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-import demjson
+import json
+from urllib.parse import unquote
+
 from scrapy.utils.misc import load_object
 from scrapy.utils.serialize import ScrapyJSONEncoder
 from twisted.internet.defer import Deferred
@@ -12,10 +14,18 @@ from .conf import settings
 from .utils import extract_scrapy_request_args, to_bytes
 
 
+class AdaptedScrapyJSONEncoder(ScrapyJSONEncoder):
+    def default(self, o):
+        if isinstance(o, bytes):
+            return o.decode('utf8')
+        else:
+            return super().default(o)
+
+
 # XXX super() calls won't work wihout object mixin in Python 2
 # maybe this can be removed at some point?
 class ServiceResource(resource.Resource, object):
-    json_encoder = ScrapyJSONEncoder()
+    json_encoder = AdaptedScrapyJSONEncoder()
 
     def __init__(self, root=None):
         resource.Resource.__init__(self)
@@ -79,6 +89,7 @@ class ServiceResource(resource.Resource, object):
         # Twisted HTTP Error objects still have 'message' attribute even in 3+
         # and they fail on str(exception) call.
         msg = exception.message if hasattr(exception, 'message') else str(exception)
+
         return {
             "status": "error",
             "message": msg,
@@ -87,12 +98,13 @@ class ServiceResource(resource.Resource, object):
 
     def render_object(self, obj, request):
         r = self.json_encoder.encode(obj) + "\n"
+
         request.setHeader('Content-Type', 'application/json')
         request.setHeader('Access-Control-Allow-Origin', '*')
         request.setHeader('Access-Control-Allow-Methods',
                           ', '.join(getattr(self, 'allowedMethods', [])))
         request.setHeader('Access-Control-Allow-Headers', 'X-Requested-With')
-        request.setHeader('Content-Length', len(r))
+        request.setHeader('Content-Length', str(len(r)))
         return r.encode("utf8")
 
 
@@ -124,6 +136,7 @@ class CrawlResource(ServiceResource):
         scrapy_request_args = extract_scrapy_request_args(api_params,
                                                           raise_error=False)
         self.validate_options(scrapy_request_args, api_params)
+
         return self.prepare_crawl(api_params, scrapy_request_args, **kwargs)
 
     def render_POST(self, request, **kwargs):
@@ -144,10 +157,11 @@ class CrawlResource(ServiceResource):
         """
         request_body = request.content.getvalue()
         try:
-            api_params = demjson.decode(request_body)
-        except demjson.JSONDecodeError as e:
+            api_params = json.loads(request_body)
+        except Exception as e:
             message = "Invalid JSON in POST body. {}"
-            message = message.format(e.pretty_description())
+            message = message.format(e)
+            # TODO should be integer not string?
             raise Error('400', message=message)
 
         log.msg("{}".format(api_params))
@@ -212,17 +226,33 @@ class CrawlResource(ServiceResource):
             max_requests = api_params['max_requests']
         except (KeyError, IndexError):
             max_requests = None
+
+        crawl_args = api_params.get("crawl_args")
+        if isinstance(crawl_args, str):
+            try:
+                crawl_args = json.loads(unquote(crawl_args))
+            except Exception as e:
+                msg = "crawl_args must be valid url encoded JSON"
+                msg += " this string cannot be decoded with JSON"
+                msg += f' {str(e)}'
+                raise Error('400', message=msg)
+
         dfd = self.run_crawl(
             spider_name, scrapy_request_args, max_requests,
-            start_requests=start_requests, *args, **kwargs)
+            start_requests=start_requests,
+            crawl_args=crawl_args,
+            *args,
+            **kwargs)
         dfd.addCallback(
             self.prepare_response, request_data=api_params, *args, **kwargs)
         return dfd
 
     def run_crawl(self, spider_name, scrapy_request_args,
-                  max_requests=None, start_requests=False, *args, **kwargs):
+                  max_requests=None, crawl_args=None, start_requests=False, *args, **kwargs):
         crawl_manager_cls = load_object(settings.CRAWL_MANAGER)
         manager = crawl_manager_cls(spider_name, scrapy_request_args, max_requests, start_requests=start_requests)
+        if crawl_args:
+            kwargs.update(crawl_args)
         dfd = manager.crawl(*args, **kwargs)
         return dfd
 
